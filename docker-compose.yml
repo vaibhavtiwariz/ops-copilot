@@ -1,0 +1,106 @@
+name: ops-copilot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: ops_ops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ops -d ops_ops"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ops-db-mcp:
+    build: .
+    command: python -m ops_copilot.mcp.servers.ops_db --transport http --host 0.0.0.0 --port 8001
+    # Role note (S3): this compose ships one superuser-grade role for
+    # everything. For a real deployment, point the app DSNs below at a
+    # least-privilege role (no CREATEDB, no superuser) and keep the
+    # privileged account for scripts/bootstrap_db.py only, since
+    # ensure_databases() needs CREATEDB.
+    environment: &mcp_env
+      OPS_DATABASE_URL: postgresql://ops:${POSTGRES_PASSWORD:?required}@postgres:5432/ops_ops
+      OPS_SQL_MAX_ROWS: ${OPS_SQL_MAX_ROWS:-200}
+      OPS_SQL_STATEMENT_TIMEOUT_MS: ${OPS_SQL_STATEMENT_TIMEOUT_MS:-8000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/mcp_healthcheck.py", "http://localhost:8001/mcp/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  source-control-mcp:
+    build: .
+    command: python -m ops_copilot.mcp.servers.source_control --transport http --host 0.0.0.0 --port 8002
+    environment:
+      OPS_GITHUB_TOKEN: ${OPS_GITHUB_TOKEN:-}
+      OPS_GITHUB_DEFAULT_REPO: ${OPS_GITHUB_DEFAULT_REPO:-psf/requests}
+      OPS_APPROVAL_SECRET: ${OPS_APPROVAL_SECRET:?required}
+
+  api:
+    build: .
+    command: >
+      uvicorn ops_copilot.api.main:app
+      --host 0.0.0.0 --port 8000
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      OPS_DATABASE_URL: postgresql://ops:${POSTGRES_PASSWORD:?required}@postgres:5432/ops_ops
+      OPS_CHECKPOINT_DB_URL: postgresql://ops:${POSTGRES_PASSWORD:?required}@postgres:5432/ops_checkpoints
+      OPS_MCP_TRANSPORT: http
+      OPS_OPS_DB_MCP_URL: http://ops-db-mcp:8001/mcp
+      OPS_SOURCE_CONTROL_MCP_URL: http://source-control-mcp:8002/mcp
+      OPS_AUDIT_LOG_PATH: /data/audit.jsonl
+      # Compose-internal URLs for the ollama fallback when used
+      OPS_OLLAMA_BASE_URL: ${OPS_OLLAMA_BASE_URL:-http://ollama:11434}
+    ports:
+      - "8000:8000"
+    volumes:
+      - auditdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ops-db-mcp:
+        condition: service_started
+      source-control-mcp:
+        condition: service_started
+
+  web:
+    build: ./web
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  phoenix:
+    image: arizephoenix/phoenix:version-20.21
+    profiles: ["observability"]
+    ports:
+      - "6006:6006"
+    volumes:
+      - phoenixdata:/mnt/data
+
+  ollama:
+    image: ollama/ollama:0.40.4
+    profiles: ["offline"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollamadata:/root/.ollama
+
+volumes:
+  pgdata:
+  auditdata:
+  phoenixdata:
+  ollamadata:
