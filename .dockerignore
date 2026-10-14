@@ -1,0 +1,14 @@
+# Keep secrets and build junk out of the API/MCP image (S9).
+# web/ builds with its own context; it needs its own .dockerignore.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_secret*
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+uploads/
+.git

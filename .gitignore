@@ -1,0 +1,16 @@
+# Secrets: the quickstart creates .env with real keys; never commit it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_secret*
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# Local uploads / scratch
+uploads/
+# Local audit log output (default ./data/audit.jsonl)
+data/

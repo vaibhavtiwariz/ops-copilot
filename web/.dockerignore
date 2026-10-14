@@ -1,0 +1,9 @@
+# Keep secrets and build junk out of the web image (S9).
+.env
+.env.*
+*.pem
+*.key
+*_secret*
+node_modules
+.next
+.git
