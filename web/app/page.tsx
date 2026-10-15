@@ -3,12 +3,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AgentEvent,
+  ApprovalError,
   ApprovalPayload,
   TaskView,
+  ThreadListItem,
   API_URL,
   createThread,
   getProposal,
+  getThreadAudit,
   getThreadState,
+  getTranscript,
+  hasThreadToken,
+  listThreads,
   setApiKey as setConsoleApiKey,
   submitApproval,
   wsSubprotocols,
@@ -36,11 +42,39 @@ export default function Home() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [activeNodes, setActiveNodes] = useState<string[]>([]);
   const [pending, setPending] = useState<ApprovalPayload | null>(null);
+  // Resolved approvals stay visible after the fact: the card clears on
+  // decide, but the decision itself is history worth keeping in the view.
+  // Entries come from the thread audit (authoritative, survives thread
+  // switches) plus an optimistic entry on decide; the audit fetch on
+  // refresh replaces the list.
+  const [resolvedApprovals, setResolvedApprovals] = useState<
+    {
+      summary: string;
+      kind: string;
+      approved: boolean;
+      ts?: string;
+      proposalId?: number;
+      decidedBy?: string;
+    }[]
+  >([]);
+  // Completed threads for the history panel. A thread lists only after
+  // its work finished; reopening one in this session uses its token
+  // from console memory, while after a reload it shows as locked.
+  const [threadList, setThreadList] = useState<ThreadListItem[]>([]);
+  const [lockedThread, setLockedThread] = useState<ThreadListItem | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [input, setInput] = useState("");
   // Kept in React state only: never logged, never persisted.
   const [apiKey, setApiKeyState] = useState("");
   const socketRef = useRef<WebSocket | null>(null);
+  // The connect fail timer, so switching threads clears the previous one
+  // instead of letting it post a stale "could not reach" bubble.
+  const failTimerRef = useRef<number | null>(null);
+  // refreshState runs inside the mount-time handleEvent closure, so it
+  // cannot read state directly: threadId would stay null forever and a
+  // finished run would never flip the UI back to idle. A ref carries the
+  // current value into that closure.
+  const threadIdRef = useRef<string | null>(null);
   // Tokens arrive in fragments tied to whichever model is speaking; a fresh
   // assistant bubble starts whenever a non-token frame lands in between.
   const openBubble = useRef(false);
@@ -73,6 +107,16 @@ export default function Home() {
       case "done":
         refreshState();
         break;
+      case "rate_limited":
+        // A silent "working..." reads as stalled; name the wait.
+        setBubbles((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: `rate limited, waiting ~${event.wait_seconds}s before retrying${event.context ? ` (${event.context})` : ""}…`,
+          },
+        ]);
+        break;
       case "error":
         setBubbles((prev) => [
           ...prev,
@@ -94,54 +138,128 @@ export default function Home() {
     });
   }
 
-  async function refreshState() {
-    if (!threadId) return;
+  async function refreshThreads() {
     try {
-      const data = await getThreadState(threadId);
+      setThreadList(await listThreads());
+    } catch {
+      // history is best-effort; the live thread still works without it
+    }
+  }
+
+  // First load shows history even before any thread starts.
+  useEffect(() => {
+    refreshThreads();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function refreshState() {
+    const id = threadIdRef.current;
+    if (!id) return;
+    try {
+      const data = await getThreadState(id);
       setTasks(data.tasks ?? []);
-      if (!data.awaiting) {
+      if (data.awaiting) {
+        setPending(data.awaiting);
+        setPhase("awaiting_approval");
+      } else {
+        setPending(null);
         setActiveNodes([]);
         setPhase("idle");
       }
     } catch {
       setPhase("idle"); // state refresh is best-effort
     }
+    // Transcript backstop: on open this restores the real conversation
+    // for a reopened thread; on done it lands any answer whose WS tokens
+    // were missed. Authoritative, so it replaces the streamed bubbles.
+    try {
+      setBubbles(await getTranscript(id));
+    } catch {
+      // transcript is best-effort; streamed bubbles still stand
+    }
+    // Resolved approvals from the audit: authoritative, survives thread
+    // switches (unlike session-only state), carries timestamp, proposal
+    // id, and who decided.
+    try {
+      const records = await getThreadAudit(id);
+      setResolvedApprovals(
+        records
+          .filter((r) => r.kind === "approval" || r.kind === "rejection")
+          .map((r) => {
+            const detail = r.detail as Record<string, unknown>;
+            const payload = detail.payload as { kind?: string; proposal_id?: number } | undefined;
+            const proposalId =
+              typeof detail.proposal_id === "number"
+                ? detail.proposal_id
+                : typeof payload?.proposal_id === "number"
+                  ? payload.proposal_id
+                  : undefined;
+            return {
+              summary: r.summary,
+              kind: payload?.kind ?? (proposalId != null ? "db_write" : "unknown"),
+              approved: r.kind === "approval",
+              ts: r.ts,
+              proposalId,
+              decidedBy: r.actor,
+            };
+          }),
+      );
+    } catch {
+      // audit history is best-effort; optimistic entries still stand
+    }
+    // A finished run may have just added this thread to history.
+    refreshThreads();
   }
 
-  const startThread = useCallback(async () => {
+  // Connect the console socket to a thread id, new or existing. Switching
+  // to an existing thread reuses its token from console memory; the
+  // transcript reloads from the server (refreshState), so reopening
+  // shows the real conversation, not an empty transcript.
+  function connectThread(id: string) {
+    setPhase("connecting");
+    socketRef.current?.close();
+    const ws = new WebSocket(
+      `${API_URL.replace(/^http/, "ws")}/ws/${id}`,
+      wsSubprotocols(id),
+    );
+    socketRef.current = ws;
+    if (failTimerRef.current) window.clearTimeout(failTimerRef.current);
+    const failTimer = window.setTimeout(() => {
+      setBubbles((prev) => [
+        ...prev,
+        { role: "system", content: "error: could not reach the API websocket, is the backend up?" },
+      ]);
+      setPhase("idle");
+    }, 8000);
+    failTimerRef.current = failTimer;
+    ws.onopen = () => {
+      window.clearTimeout(failTimer);
+      threadIdRef.current = id;
+      setThreadId(id);
+      setBubbles([]);
+      setTasks([]);
+      setPending(null);
+      setResolvedApprovals([]);
+      setActiveNodes([]);
+      setLockedThread(null);
+      refreshState();
+    };
+    ws.onmessage = (evt) => handleEvent(JSON.parse(evt.data) as AgentEvent);
+    ws.onerror = () => {
+      window.clearTimeout(failTimer);
+      setBubbles((prev) => [
+        ...prev,
+        { role: "system", content: `error: websocket to ${API_URL} failed: check OPS_CORS_ORIGINS and that port 8000 is reachable` },
+      ]);
+      setPhase("idle");
+    };
+  }
+
+  async function startThread() {
     setPhase("connecting");
     try {
       const { threadId: id } = await createThread();
-      const ws = new WebSocket(
-        `${API_URL.replace(/^http/, "ws")}/ws/${id}`,
-        wsSubprotocols(id),
-      );
-      socketRef.current = ws;
-      const failTimer = window.setTimeout(() => {
-        setBubbles((prev) => [
-          ...prev,
-          { role: "system", content: "error: could not reach the API websocket, is the backend up?" },
-        ]);
-        setPhase("idle");
-      }, 8000);
-      ws.onopen = () => {
-        window.clearTimeout(failTimer);
-        setThreadId(id);
-        setBubbles([]);
-        setTasks([]);
-        setPending(null);
-        setActiveNodes([]);
-        setPhase("idle");
-      };
-      ws.onmessage = (evt) => handleEvent(JSON.parse(evt.data) as AgentEvent);
-      ws.onerror = () => {
-        window.clearTimeout(failTimer);
-        setBubbles((prev) => [
-          ...prev,
-          { role: "system", content: `error: websocket to ${API_URL} failed: check OPS_CORS_ORIGINS and that port 8000 is reachable` },
-        ]);
-        setPhase("idle");
-      };
+      connectThread(id);
+      refreshThreads();
     } catch (err) {
       setBubbles((prev) => [
         ...prev,
@@ -149,7 +267,20 @@ export default function Home() {
       ]);
       setPhase("idle");
     }
-  }, [handleEvent]);
+  }
+
+  // Open a listed thread: fully in this session (token in memory), or show
+  // the locked card after a reload, when the token is gone and the content
+  // stays locked behind it.
+  function selectThread(item: ThreadListItem) {
+    if (hasThreadToken(item.thread_id)) {
+      setLockedThread(null);
+      connectThread(item.thread_id);
+      refreshThreads();
+    } else {
+      setLockedThread(item);
+    }
+  }
 
   // The key itself lives in the api module; startThread reads it at call
   // time, so this state only drives the input field.
@@ -173,10 +304,45 @@ export default function Home() {
 
   async function decide(approved: boolean) {
     if (!threadId || !pending) return;
+    const resolved = pending;
     setPending(null);
     setPhase("running");
-    const ok = await submitApproval(threadId, approved, approved ? "" : "declined from console");
-    if (!ok) setPhase("awaiting_approval");
+    try {
+      await submitApproval(threadId, approved, approved ? "" : "declined from console");
+    } catch (err) {
+      // A 409 means the gate is gone: the interrupt was already consumed
+      // (e.g. a 504-cancel landed past the gate), so the card is stale.
+      // Clear it and refresh instead of restoring a card that can never
+      // decide. Known limitation: the run itself is dead (interrupt
+      // consumed, no resume endpoint), so re-decide cannot revive it;
+      // the honest UI is a cleared card, a refreshed state, and a new
+      // thread. The 202 decoupling is the complete fix, a follow-up.
+      if (err instanceof ApprovalError && err.status === 409) {
+        setPending(null);
+        setBubbles((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: "approval no longer pending: the gate already moved on, state refreshed",
+          },
+        ]);
+        await refreshState();
+        return;
+      }
+      // Every other error (504 drain timeout, 502, network): restore the
+      // card so the user can re-decide, and say why.
+      setPending(resolved);
+      setPhase("awaiting_approval");
+      setBubbles((prev) => [
+        ...prev,
+        { role: "system", content: `error: ${String(err).slice(0, 200)}` },
+      ]);
+      return;
+    }
+    setResolvedApprovals((prev) => [
+      ...prev,
+      { summary: resolved.summary, kind: resolved.kind, approved },
+    ]);
   }
 
   return (
@@ -189,10 +355,40 @@ export default function Home() {
         apiKey={apiKey}
         onApiKeyChange={handleApiKeyChange}
         onStart={startThread}
+        threadList={threadList}
+        onSelectThread={selectThread}
       />
 
       <section className="flex flex-1 flex-col">
-        {!threadId ? (
+        {lockedThread ? (
+          <div className="flex flex-1 items-center justify-center">
+            <div className="w-full max-w-2xl rounded-xl border border-ink-700 bg-ink-800 px-4 py-3 text-sm text-slate-300">
+              <p className="font-medium text-slate-200">
+                Thread {lockedThread.thread_id} is locked
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                {lockedThread.created_at
+                  ? new Date(lockedThread.created_at).toLocaleString()
+                  : "unknown time"}
+                {" · "}
+                {lockedThread.status === "rejected" ? "rejected" : "done"}
+                {" · "}
+                {lockedThread.message_count} messages
+              </p>
+              <p className="mt-2 text-sm">
+                Chat content stays locked without this thread's token, which lives
+                only in the browser session that created the thread. Start a new
+                thread to continue.
+              </p>
+              <button
+                onClick={() => setLockedThread(null)}
+                className="mt-3 rounded-md border border-ink-700 px-4 py-1.5 text-sm text-slate-300 hover:bg-ink-800"
+              >
+                Back to current thread
+              </button>
+            </div>
+          </div>
+        ) : !threadId ? (
           <div className="flex flex-1 items-center justify-center">
             <button
               onClick={startThread}
@@ -228,6 +424,33 @@ export default function Home() {
               ))}
               {pending && threadId && (
                 <ApprovalCard threadId={threadId} payload={pending} onDecide={decide} />
+              )}
+              {resolvedApprovals.length > 0 && (
+                <div className="mx-auto w-full max-w-2xl space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+                    resolved approvals
+                  </p>
+                  {resolvedApprovals.map((r, i) => (
+                    <div
+                      key={i}
+                      className="rounded-xl border border-ink-700 bg-ink-800 px-4 py-3 text-sm text-slate-300"
+                    >
+                      <span
+                        className={
+                          r.approved ? "font-medium text-emerald-300" : "font-medium text-rose-300"
+                        }
+                      >
+                        {r.approved ? "Approved" : "Rejected"}
+                      </span>{" "}
+                      <span className="text-slate-500">({r.kind})</span> {r.summary}
+                      <span className="block text-xs text-slate-500">
+                        {r.ts ? new Date(r.ts).toLocaleString() : ""}
+                        {r.proposalId != null ? ` · proposal ${r.proposalId}` : ""}
+                        {r.decidedBy ? ` · by ${r.decidedBy}` : ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
 
@@ -269,6 +492,8 @@ function Sidebar({
   apiKey,
   onApiKeyChange,
   onStart,
+  threadList,
+  onSelectThread,
 }: {
   threadId: string | null;
   phase: Phase;
@@ -277,6 +502,8 @@ function Sidebar({
   apiKey: string;
   onApiKeyChange: (value: string) => void;
   onStart: () => void;
+  threadList: ThreadListItem[];
+  onSelectThread: (item: ThreadListItem) => void;
 }) {
   return (
     <aside className="hidden w-72 flex-col border-r border-ink-700 bg-ink-900 p-4 md:flex">
@@ -333,6 +560,42 @@ function Sidebar({
                 <p className="mt-1 line-clamp-2 text-xs text-slate-400">{t.description}</p>
               </li>
             ))}
+          </ul>
+        </>
+      )}
+
+      {threadList.length > 0 && (
+        <>
+          <h2 className="mt-8 text-xs font-semibold uppercase tracking-widest text-slate-500">history</h2>
+          <p className="mt-1 text-[10px] text-slate-600">threads for this API key</p>
+          <ul className="mt-2 space-y-2 overflow-y-auto">
+            {threadList.map((t) => {
+              const open = hasThreadToken(t.thread_id);
+              return (
+                <li key={t.thread_id}>
+                  <button
+                    onClick={() => onSelectThread(t)}
+                    className={`w-full rounded-md border p-2.5 text-left ${
+                      t.thread_id === threadId
+                        ? "border-emerald-600/50 bg-ink-800"
+                        : "border-ink-700 bg-ink-800"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-xs text-slate-300">{t.thread_id}</span>
+                      <span className="ml-auto text-[10px] uppercase text-slate-500">
+                        {t.status === "rejected" ? "rejected" : "done"}
+                        {!open ? " · locked" : ""}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {t.created_at ? new Date(t.created_at).toLocaleString() : "unknown time"}
+                      {t.message_count > 0 ? ` · ${t.message_count} messages` : ""}
+                    </p>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </>
       )}

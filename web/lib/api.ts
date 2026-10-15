@@ -6,6 +6,7 @@ export type AgentEvent =
   | { type: "interrupt"; id?: string; payload?: ApprovalPayload; interrupts?: { id: string; payload: ApprovalPayload }[] }
   | { type: "done" }
   | { type: "error"; message: string; detail?: string }
+  | { type: "rate_limited"; wait_seconds: number; context?: string }
   | { type: "pong" };
 
 export interface ApprovalPayload {
@@ -95,6 +96,31 @@ export interface ThreadHandle {
   threadToken: string;
 }
 
+export interface AuditRecord {
+  ts: string;
+  kind: string;
+  actor: string;
+  summary: string;
+  detail: Record<string, unknown>;
+}
+
+export interface ThreadListItem {
+  thread_id: string;
+  created_at: string | null;
+  status: string;
+  message_count: number;
+}
+
+export async function listThreads(): Promise<ThreadListItem[]> {
+  const res = await fetch(`${API_URL}/api/threads`, { headers: withAuth() });
+  if (!res.ok) throw new Error(`thread list failed (${res.status})`);
+  return (await res.json()) as ThreadListItem[];
+}
+
+export function hasThreadToken(threadId: string): boolean {
+  return threadTokens.has(threadId);
+}
+
 export async function createThread(): Promise<ThreadHandle> {
   const res = await fetch(`${API_URL}/api/threads`, {
     method: "POST",
@@ -120,6 +146,22 @@ export async function getThreadState(
   return (await res.json()) as { tasks: TaskView[]; awaiting: ApprovalPayload | null };
 }
 
+export async function getTranscript(threadId: string): Promise<ChatMessage[]> {
+  const res = await fetch(`${API_URL}/api/threads/${threadId}/transcript`, {
+    headers: threadHeaders(threadId),
+  });
+  if (!res.ok) throw new Error(`transcript fetch failed (${res.status})`);
+  return (await res.json()) as ChatMessage[];
+}
+
+export async function getThreadAudit(threadId: string): Promise<AuditRecord[]> {
+  const res = await fetch(`${API_URL}/api/threads/${threadId}/audit`, {
+    headers: threadHeaders(threadId),
+  });
+  if (!res.ok) throw new Error(`audit fetch failed (${res.status})`);
+  return (await res.json()) as AuditRecord[];
+}
+
 export async function getProposal(
   threadId: string,
   proposalId: number,
@@ -132,6 +174,15 @@ export async function getProposal(
   return (await res.json()) as ProposalView;
 }
 
+export class ApprovalError extends Error {
+  status: number;
+  constructor(status: number, detail: string) {
+    super(`approval failed (${status})${detail ? `: ${detail}` : ""}`);
+    this.name = "ApprovalError";
+    this.status = status;
+  }
+}
+
 export async function submitApproval(
   threadId: string,
   approved: boolean,
@@ -142,5 +193,17 @@ export async function submitApproval(
     headers: threadHeaders(threadId, { "Content-Type": "application/json" }),
     body: JSON.stringify({ approved, note, decided_by: "ops-reviewer" }),
   });
-  return res.ok;
+  if (!res.ok) {
+    // The decision did not go through (504 drain timeout, 409 busy, 502).
+    // The caller branches on status: 409 means the gate is gone, every
+    // other error restores the pending card for a re-decide.
+    let detail = "";
+    try {
+      detail = (await res.json()).detail ?? "";
+    } catch {
+      detail = "";
+    }
+    throw new ApprovalError(res.status, detail);
+  }
+  return true;
 }
