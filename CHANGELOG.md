@@ -2,6 +2,51 @@
 
 Running log of every change the fix team makes and why. Newest first. Each entry names the finding, the files touched, what changed, and why in plain language.
 
+## 2026-10-15: FIX: WebSocket idle timeout no longer kills a socket mid-run
+- Files: src/ops_copilot/api/main.py, src/ops_copilot/api/ratelimit.py, tests/integration/test_ws_idle_during_resume.py (new)
+- What: the WebSocket loop closes a socket with code 4408 after WS_IDLE_TIMEOUT_S (600 seconds, 10 minutes) with no inbound frame, instead of letting idle sockets linger with their queue and pump task. Exception: if the runner reports the thread busy, the loop keeps waiting instead of closing, because a run in flight (for example an approval resume driven by the HTTP endpoint, not by this socket) still needs this socket for its done event. Tests: 2 new tests (socket survives the idle timeout during a resume; a truly idle socket still closes with 4408).
+- Why: an approval resume is driven by the HTTP endpoint, so the socket sits idle in receive while the resume runs. An idle timeout firing mid-resume closed the socket and the resume's done event never arrived. Caveat: the resume test does not discriminate in TestClient (queued frames are delivered after close), so the live check on a long resume is still the final proof.
+
+## 2026-10-15: FIX: worker tool calls now have a 60-second timeout
+- Files: src/ops_copilot/graph/workers.py, tests/unit/test_worker_tool_timeout.py (new)
+- What: new _execute_tool wraps every worker MCP tool call in asyncio.wait_for with TOOL_TIMEOUT_S (60.0 seconds). On timeout the worker gets a JSON error observation ("tool X timed out") it can work with, instead of hanging. Other tool exceptions still return JSON error observations, and successful results are unchanged.
+- Why: an MCP tool call with no deadline can stall a run silently forever (a wedged server, a dropped response). Bounding it turns a silent hang into an error the worker can report or route around. Tests: 3 new tests (hanging tool returns the timeout error fast, failing tool still returns error JSON, ok tool still returns its result).
+
+## 2026-10-15: FIX: approval card no longer loops on a 409, history newest-first
+- Files: web/lib/api.ts, web/app/page.tsx, src/ops_copilot/api/main.py, tests/unit/test_llm_normalizer.py, tests/integration/test_api_ws.py
+- What: submitApproval now throws a typed ApprovalError carrying the HTTP status, and decide() branches on it. On a 409 (gate gone, interrupt already consumed) it clears the stale card, shows a system bubble ("approval no longer pending: the gate already moved on, state refreshed"), and refreshes state instead of restoring a card that can never decide. On all other errors (504 drain timeout, 502, network) it still restores the card so the user can re-decide. Correction to the earlier approval-history entry in this log: that entry said a failed POST restores the card for 504, 409, and 502; the 409 case now clears instead. The history panel sorts newest-first. The transcript endpoint skips AIMessage content starting with "[guardrail]", so reopening a thread no longer shows internal plumbing as a chat bubble. Tests: 2 new normalizer tests (tool-transcript append keeps the AIMessage(tool_calls)/ToolMessage pair adjacent with the HumanMessage last; empty-list case) and a backend contract test (POST /approvals with nothing waiting returns 409, "nothing is waiting"). The frontend 409 branch itself has no JS test harness in this repo (no vitest/jest), so it is covered by the contract test plus tsc.
+- Why: after a 504-cancel that lands past the gate, the gate has already cleared awaiting and the interrupt is consumed, so every re-decide got 409 while the UI kept restoring the card: an infinite approve-to-409 loop that actively misled, worse than the original "nothing happened". Known limitation, not fixed here: after a past-gate 504 the run itself is dead (interrupt consumed, no resume endpoint), so re-decide cannot revive it; the UI is now honest about that (card clears, state refreshes, new thread). The 202 decoupling of the approval POST is the complete fix and stays a follow-up.
+
+## 2026-10-15: FIX: approval resume now delivers the resumed answer
+- Files: src/ops_copilot/api/runner.py, src/ops_copilot/api/main.py, src/ops_copilot/api/schemas.py, web/lib/api.ts, web/app/page.tsx
+- What: the runner now also publishes token and node events to the event bus when a run is resumed after an approval, so the WebSocket receives the resumed run's answer exactly like a user turn. New token-gated GET /threads/{id}/transcript returns the thread's chat transcript (human and assistant text only, no tool messages, no SQL), and the console fetches it on thread open and on run done, so a reopened thread shows its real conversation and a run whose streamed tokens were missed still lands its answer.
+- Why: the approval endpoint resumed the run through a drain that discarded every yielded event, and the console on done only fetched tasks and approvals, never the conversation. The write applied, but the console showed nothing after approval. The approval POST still waits for the resume to finish; returning 202 and streaming via WebSocket is deferred to its own review pass.
+
+## 2026-10-15: FIX: every LLM call now carries a user message (systemic normalizer)
+- Files: src/ops_copilot/llm.py, src/ops_copilot/graph/supervisor.py
+- What: new ensure_user_message in llm.py, wired into ainvoke_patient so every call site (planner, synthesis, workers, future calls) is covered. It is append-only and only-if-absent: if no user-role message exists it appends one, and it never splits an AIMessage(tool_calls)/ToolMessage pair, so tool transcripts are untouched. Synthesis also carries the real user query from state for prompt quality.
+- Why: qwen's chat template rejects prompts with no user message ("No user query found in messages"). The synthesis prompt was system-only, and a worker prompt can lose its user turn when the 24-message context tail slices past the last user message, so patching synthesis alone left every worker call exposed. The live Groq/qwen call is still the final proof; the unit tests prove the prompt now carries a user message.
+
+## 2026-10-15: FIX: approval history reads from the audit log, card restored on failure
+- Files: web/lib/api.ts, web/app/page.tsx
+- What: the console's resolved-approvals list now comes from GET /threads/{id}/audit (token-gated), with timestamp, proposal id, and decided-by from the audit record, so the history survives thread switches and reloads. If the approval POST fails (504, 409, 502), decide() restores the approval card, returns the phase to awaiting approval, and shows an error bubble, so the user can re-decide. The history panel is labeled "threads for this API key" because the list endpoint returns all threads for the shared key, not per-user threads. The console also fetches the thread list on first load, so history shows before any thread starts.
+- Why: the history lived in React state, which the thread opener cleared on switch, and a failed approval POST dropped the card with no way to re-decide. Decided-by is the caller-asserted value from the approval record, per the S12 honesty note.
+
+## 2026-10-15: FIX: rate-limit waits now show in the console
+- Files: src/ops_copilot/llm.py, src/ops_copilot/api/runner.py, web/lib/api.ts, web/app/page.tsx
+- What: a rate_limit_sink ContextVar carries the event bus and thread id into ainvoke_patient during a run; on a 429 it publishes a rate_limited event (wait seconds, context), and the console appends a system bubble ("rate limited, waiting ~20s before retrying (triage:step2)…"). The phase stays running.
+- Why: waits were log-only, so the console showed silent "working…" and the user read a rate-limit wait as a stall. A failed publish cannot break the retry.
+
+## 2026-10-15: FIX: unverified-action tag now needs an actual assertion
+- Files: src/ops_copilot/guardrails.py, tests/unit/test_claim_guardrail.py
+- What: claims_execution now matches only first-person assertions ("I refunded", "we have processed") or passive-with-auxiliary assertions ("the order has been refunded"). Bare participles ("orders processed", "Comment posted on the PR") no longer match. One existing test updated with the rationale.
+- Why: the old regex matched past-tense verbs anywhere in worker prose, so a read-only revenue summary got branded "[unverified action claim]", the tag prefixed the task summary, and a guardrail message was appended to conversation state, polluting context and confusing synthesis.
+
+## 2026-10-15: TEST: resume, transcript, normalizer, and claim-guardrail tests
+- Files: tests/unit/test_llm_normalizer.py (new), tests/unit/test_runner_resume_bus.py (new), tests/integration/test_thread_transcript.py (new), tests/unit/test_synthesis_user_message.py, tests/unit/test_claim_guardrail.py
+- What: 6 normalizer tests (append-only, unchanged-if-present, tool transcripts not split, rate-limit publish with sink, retry without sink, normalizer inside ainvoke_patient), 2 resume-bus tests (resume publishes tokens to the bus, normal turn stays generator-only), 3 transcript tests (conversation returned, empty for a fresh thread, 403 without/wrong token), 2 synthesis tests (prompt carries the user query), and the claim-guardrail update (bare participles not flagged, first-person and passive still flagged). The resume-bus test fails on reverted code (tokens discarded) and passes on fixed code.
+- Why: so each fix in this pass is proven by a test that fails without it. A dedicated test_thread_list.py for the list endpoint was not written; the list endpoint is covered indirectly by the panel behavior.
+
 ## 2026-10-15: DOC: README notes the uv lock flow for reproducible builds
 - Files: README.md
 - What: added a line telling the host operator to run `uv lock` on the dev machine and switch the Dockerfile back to `uv sync --frozen` when locking dependencies.
