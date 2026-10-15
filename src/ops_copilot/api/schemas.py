@@ -13,6 +13,20 @@ class ThreadCreated(BaseModel):
     thread_token: str
 
 
+class ThreadListItem(BaseModel):
+    """One completed thread for the console history panel.
+
+    Time is the last checkpoint write (completion time); status is done
+    unless some task was rejected or failed. No content is included, so
+    a listed thread stays locked behind its token.
+    """
+
+    thread_id: str
+    created_at: datetime | None = None
+    status: str = "done"
+    message_count: int = 0
+
+
 class ProposalView(BaseModel):
     """The exact SQL of a registered proposal, for the human reviewer.
 
@@ -42,6 +56,19 @@ class StateView(BaseModel):
     awaiting: dict[str, Any] | None = None
     error: str | None = None
     message_count: int = 0
+
+
+class TranscriptMessage(BaseModel):
+    """One chat turn for the console transcript.
+
+    Human and assistant text only: tool messages and empty assistant turns
+    (tool-call-only) are omitted, since the console renders conversation,
+    not tool plumbing. Served by GET /threads/{id}/transcript, token-gated
+    like /state (S4). No SQL: tool results are never included.
+    """
+
+    role: str
+    content: str
 
 
 class CheckpointView(BaseModel):

@@ -8,6 +8,8 @@ with a Redis-backed counter behind the same allow() signature.
 Constants, documented because they are the policy:
 - THREAD_CREATE_PER_MINUTE = 20: each thread fans out to full LLM graph
   runs, so thread creation itself is throttled per API key.
+- THREAD_LIST_PER_MINUTE = 30: listing reads one checkpoint per thread,
+  so it is throttled like the other read-heavy surfaces.
 - REPLAY_PER_MINUTE = 10: replay re-executes graph turns from checkpoints,
   each one billable model work.
 - WS_MAX_CONNECTIONS = 100: global cap; every socket pins a queue, a pump
@@ -25,6 +27,7 @@ import time
 from collections import deque
 
 THREAD_CREATE_PER_MINUTE = 20
+THREAD_LIST_PER_MINUTE = 30
 REPLAY_PER_MINUTE = 10
 WS_MAX_CONNECTIONS = 100
 WS_IDLE_TIMEOUT_S = 600

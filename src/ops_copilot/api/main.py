@@ -19,6 +19,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -29,6 +30,7 @@ from ops_copilot.api.events import EventBus
 from ops_copilot.api.ratelimit import (
     REPLAY_PER_MINUTE,
     THREAD_CREATE_PER_MINUTE,
+    THREAD_LIST_PER_MINUTE,
     WS_IDLE_TIMEOUT_S,
     WS_MAX_CONNECTIONS,
     RateLimiter,
@@ -144,6 +146,71 @@ def create_app(*, graph=None, settings: Settings | None = None) -> FastAPI:
         thread_token = await _issue_thread_token(request, thread_id)
         return schemas.ThreadCreated(thread_id=thread_id, thread_token=thread_token)
 
+    @api.get("/threads", response_model=list[schemas.ThreadListItem])
+    async def list_threads(request: Request, x_api_key: str | None = Header(default=None)):
+        """Completed threads for the console history panel.
+
+        History is for finished work: a thread appears only once its run
+        is at rest with nothing awaiting and every task in a terminal
+        state (or a completed direct reply with no tasks). In-progress,
+        awaiting, and never-used threads do not list. No content is
+        returned, so a thread stays locked behind its token even though
+        its id is listed.
+        """
+        _check_key(request, x_api_key)
+        _check_rate_limit(request, x_api_key, "thread_list", THREAD_LIST_PER_MINUTE)
+        pool = getattr(request.app.state, "app_pool", None)
+        if pool is None:
+            raise HTTPException(status_code=503, detail="thread store unavailable")
+        try:
+            async with pool.connection() as conn:
+                cursor = await conn.execute(
+                    "select thread_id, created_at from thread_tokens "
+                    "order by created_at desc limit 50"
+                )
+                rows = await cursor.fetchall()
+        except Exception as exc:
+            log.error("thread_list_failed", error=str(exc))
+            raise HTTPException(status_code=503, detail="thread store unavailable") from exc
+        runner = request.app.state.runner
+        items: list[schemas.ThreadListItem] = []
+        for row in rows:
+            thread_id = row["thread_id"]
+            try:
+                snapshot = await runner.graph.aget_state({"configurable": {"thread_id": thread_id}})
+            except Exception:
+                continue
+            if getattr(snapshot, "next", None):
+                continue  # mid-run or paused at the gate: not finished work
+            if pending_payload(snapshot) is not None:
+                continue  # approval still outstanding: not finished work
+            values = getattr(snapshot, "values", None) or {}
+            tasks = values.get("tasks") or []
+            message_count = len(values.get("messages") or [])
+            if tasks:
+                if any(t.status not in ("done", "failed", "rejected") for t in tasks):
+                    continue
+                status = (
+                    "rejected" if any(t.status in ("failed", "rejected") for t in tasks) else "done"
+                )
+            elif message_count >= 2:
+                status = "done"
+            else:
+                continue  # created but never used: no finished work
+            last_active = getattr(snapshot, "created_at", None) or row["created_at"]
+            items.append(
+                schemas.ThreadListItem(
+                    thread_id=thread_id,
+                    created_at=last_active,
+                    status=status,
+                    message_count=message_count,
+                )
+            )
+        items.sort(
+            key=lambda item: item.created_at.isoformat() if item.created_at else "", reverse=True
+        )
+        return items
+
     @api.get("/threads/{thread_id}/state", response_model=schemas.StateView)
     async def thread_state(
         thread_id: str,
@@ -179,6 +246,46 @@ def create_app(*, graph=None, settings: Settings | None = None) -> FastAPI:
             message_count=len(values.get("messages") or []),
             error=values.get("error"),
         )
+
+    @api.get("/threads/{thread_id}/transcript", response_model=list[schemas.TranscriptMessage])
+    async def thread_transcript(
+        thread_id: str,
+        request: Request,
+        x_api_key: str | None = Header(default=None),
+        x_thread_token: str | None = Header(default=None),
+    ):
+        """The thread's chat transcript, for reopening and as a WS backstop.
+
+        Token-gated like /state (S4). Human and assistant text only: tool
+        messages are omitted, and assistant turns with no text (tool-call
+        only) are skipped. The console fetches this on thread open (so a
+        reopened thread shows its real conversation) and on done (so a run
+        whose WS tokens were missed still lands its answer).
+        """
+        _check_key(request, x_api_key)
+        await _check_thread_token(request, thread_id, x_thread_token)
+        runner = request.app.state.runner
+        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = await runner.graph.aget_state(config)
+        values = getattr(snapshot, "values", None) or {}
+        out: list[schemas.TranscriptMessage] = []
+        for message in values.get("messages") or []:
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if isinstance(message, HumanMessage):
+                out.append(schemas.TranscriptMessage(role="user", content=content))
+            elif isinstance(message, AIMessage):
+                if content.startswith("[guardrail]"):
+                    continue  # internal plumbing, not conversation
+                out.append(schemas.TranscriptMessage(role="assistant", content=content))
+        return out
 
     @api.get("/threads/{thread_id}/history", response_model=list[schemas.CheckpointView])
     async def thread_history(
@@ -589,8 +696,13 @@ async def _websocket_session(socket: WebSocket, thread_id: str) -> None:
             try:
                 # S7: idle sockets (no inbound frame for 10 minutes) are
                 # closed instead of lingering with their queue and pump task.
+                # Exception: a run in flight (for example an approval resume
+                # driven by the HTTP endpoint, not by this socket) still
+                # needs this socket for its done event, so keep waiting.
                 inbound = await asyncio.wait_for(socket.receive_json(), timeout=WS_IDLE_TIMEOUT_S)
             except TimeoutError:
+                if runner.is_busy(thread_id):
+                    continue
                 log.info("ws_idle_timeout", thread_id=thread_id)
                 await socket.close(code=4408)
                 return

@@ -14,6 +14,7 @@ from langgraph.types import Command
 from ops_copilot.api.errors import public_error
 from ops_copilot.api.events import EventBus
 from ops_copilot.graph.build import runnable_config
+from ops_copilot.llm import rate_limit_sink
 from ops_copilot.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,6 +46,11 @@ class GraphRunner:
             self._locks[thread_id] = asyncio.Lock()
         return self._locks[thread_id]
 
+    def is_busy(self, thread_id: str) -> bool:
+        """True while a run (turn or approval resume) holds this thread's lock."""
+        lock = self._locks.get(thread_id)
+        return lock.locked() if lock is not None else False
+
     async def run_turn(
         self,
         thread_id: str,
@@ -71,12 +77,22 @@ class GraphRunner:
 
         async with lock:
             await self.bus.publish(thread_id, {"type": "run_started"})
+            # Rate-limit waits inside the graph surface as console events.
+            sink_token = rate_limit_sink.set((self.bus, thread_id))
             try:
                 async for mode, chunk in self.graph.astream(
                     payload, config, stream_mode=["updates", "messages"]
                 ):
                     event = _translate(mode, chunk)
                     if event:
+                        # An approval resume has no direct consumer (_drain
+                        # discards the generator), so its tokens only reach
+                        # the console via the bus. Normal turns keep tokens
+                        # generator-only to avoid duplicating them through
+                        # the WS pump. Replay uses replay_from, not
+                        # resume_value, so it is unaffected.
+                        if resume_value is not None and event["type"] in ("token", "node"):
+                            await self.bus.publish(thread_id, event)
                         yield event
                 # A pinned checkpoint_id describes where the run started, not
                 # what it produced. Strip it so the post-run state (and any
@@ -97,6 +113,8 @@ class GraphRunner:
                 message = f"run failed: {public_error(exc)}"
                 await self.bus.publish(thread_id, {"type": "error", "message": message})
                 yield {"type": "error", "message": message}
+            finally:
+                rate_limit_sink.reset(sink_token)
 
 
 def _translate(mode: str, chunk: Any) -> dict | None:
