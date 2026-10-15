@@ -2,6 +2,11 @@
 
 Running log of every change the fix team makes and why. Newest first. Each entry names the finding, the files touched, what changed, and why in plain language.
 
+## 2026-10-15: FIX: lint fix on the proxy port check
+- Files: src/ops_copilot/mcp/client.py
+- What: assigned the port check result instead of leaving it as a bare expression.
+- Why: the linter flags a bare expression as a useless statement, so the project's own lint gate failed. Same behavior, no logic change.
+
 ## 2026-10-15: FIX: missing await on async database reads broke three API paths
 - Files: src/ops_copilot/api/main.py
 - What: added await to three fetchone() calls on the async Postgres cursor (proposal lookup, thread-token lookup, approval insert check).
