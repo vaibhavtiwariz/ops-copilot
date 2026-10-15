@@ -2,6 +2,21 @@
 
 Running log of every change the fix team makes and why. Newest first. Each entry names the finding, the files touched, what changed, and why in plain language.
 
+## 2026-10-15: FIX: missing await on async database reads broke three API paths
+- Files: src/ops_copilot/api/main.py
+- What: added await to three fetchone() calls on the async Postgres cursor (proposal lookup, thread-token lookup, approval insert check).
+- Why: fetchone() on an async cursor is itself a coroutine, so without await each call returned a coroutine object instead of a row. The proposal endpoint 503d, the thread-token check always failed, and the approval insert was silently skipped, so the API approval flow could never complete. The existing tests missed it because one test file replaces the token lookup with a fake. A sweep of the whole src tree found no other unawaited async cursor calls; the MCP server uses sync psycopg, where fetchone() is correctly synchronous.
+
+## 2026-10-15: FIX: stdio MCP servers now receive their environment
+- Files: src/ops_copilot/mcp/client.py
+- What: the stdio server configs now carry an env built from OPS_* settings, basic process vars, and only proxy vars that parse cleanly. Malformed proxy values (like a NO_PROXY containing "[::1]") are dropped instead of forwarded. Proxy URL validation also checks the port, so values with a bad port (like http://proxy:abc, http://proxy:80x, or http://proxy:99999) are dropped instead of crashing httpx, which raises on those at client construction.
+- Why: the SDK spawn inherits only a small safe subset on Linux, so OPS_DATABASE_URL never reached the servers and every database call failed in stdio mode, which is the documented no-Docker path. The HTTP path is unchanged.
+
+## 2026-10-15: TEST: regression tests for the async-fetchone and stdio-env bugs
+- Files: tests/integration/test_api_async_db.py, tests/unit/test_stdio_env.py, tests/integration/test_mcp_stdio.py
+- What: the async tests exercise the real token lookup, approval insert, and proposal endpoint against a real async pool with no fakes; the stdio tests prove the config env carries OPS_* and drops malformed proxy values, plus a live test that spawns the real ops-db server and runs a query through it.
+- Why: so neither bug can silently come back. All new tests were run against the unfixed code first and failed there (21 failed, 1 passed), then passed on the fixed code (22 passed).
+
 ## 2026-10-14: TEST: regression suite for the fix pass (9 files)
 - Files: tests/regression/conftest.py
 - What: sets up throwaway test values (fake API key, fake approval secret, fake audit log path) so the regression tests run with no live services, no network, and no database.

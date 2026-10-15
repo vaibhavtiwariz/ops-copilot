@@ -327,13 +327,11 @@ def create_app(*, graph=None, settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="proposal store unavailable")
         try:
             async with pool.connection() as conn:
-                row = (
-                    await conn.execute(
-                        "select id, action, table_name, sql_text, status "
-                        "from proposals where id = %s",
-                        (proposal_id,),
-                    )
-                ).fetchone()
+                cursor = await conn.execute(
+                    "select id, action, table_name, sql_text, status from proposals where id = %s",
+                    (proposal_id,),
+                )
+                row = await cursor.fetchone()
         except Exception as exc:
             log.error("proposal_lookup_failed", proposal_id=proposal_id, error=str(exc))
             raise HTTPException(status_code=503, detail="proposal store unavailable") from exc
@@ -449,12 +447,11 @@ async def _issue_thread_token(request: Request, thread_id: str) -> str:
 async def _lookup_token_hash(pool: Any, thread_id: str) -> str:
     """Fetch the stored sha256 for a thread id, "" when unknown."""
     async with pool.connection() as conn:
-        row = (
-            await conn.execute(
-                "select token_hash from thread_tokens where thread_id = %s",
-                (thread_id,),
-            )
-        ).fetchone()
+        cursor = await conn.execute(
+            "select token_hash from thread_tokens where thread_id = %s",
+            (thread_id,),
+        )
+        row = await cursor.fetchone()
         return row["token_hash"] if row else ""
 
 
@@ -507,7 +504,7 @@ async def _record_db_approval(
         existing = await conn.execute(
             "select id from approvals where proposal_id = %s", (proposal_id,)
         )
-        if existing.fetchone() is None:
+        if (await existing.fetchone()) is None:
             await conn.execute(
                 """
                 insert into approvals (proposal_id, approved, note, decided_by)
