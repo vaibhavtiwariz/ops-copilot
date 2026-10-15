@@ -216,11 +216,20 @@ class BudgetExceeded(RuntimeError):
 
 
 # Past-tense execution claims that should only ever appear after a gated tool
-# actually succeeded. Deliberately conservative: false negatives are fine
-# (prompts handle those), false positives just add a harmless notice.
+# actually succeeded. Scoped to assertions, not bare verb occurrences: a
+# bare participle ("orders processed") is indistinguishable from a
+# descriptive noun phrase in a read-only summary, and flagging it branded a
+# read-only revenue answer as an unverified action claim. First-person
+# ("I refunded") and passive-with-auxiliary ("the order has been refunded")
+# are assertions. False negatives are fine (prompts handle those); false
+# positives pollute state with a guardrail message and confuse synthesis.
+_CLAIM_VERBS = (
+    r"refund(?:ed|s|ing)?|reversed?|credited|deleted|removed|updated?|"
+    r"cancelled|canceled|processed|executed|initiated|posted|sent|migrated"
+)
 _CLAIM_RE = re.compile(
-    r"\b(refund(?:ed|s|ing)?|reversed?|credited|deleted|removed|updated?|"
-    r"cancelled|canceled|processed|executed|initiated|posted|sent|migrated)\b",
+    r"\b(?:(?:I|we)\s+(?:have\s+|has\s+|'ve\s+|had\s+)?|(?:has\s+been|have\s+been|was|were)\s+)"
+    rf"({_CLAIM_VERBS})\b",
     re.IGNORECASE,
 )
 

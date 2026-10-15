@@ -6,6 +6,7 @@ that finds its server unreachable reports that instead of raising - a partial
 outage should degrade the answer, not kill the thread.
 """
 
+import asyncio
 import json
 from typing import Any, Literal
 
@@ -24,6 +25,7 @@ from .state import AgentState
 log = get_logger(__name__)
 
 MAX_TOOL_STEPS = 8
+TOOL_TIMEOUT_S = 60.0  # one MCP call may not stall a run past this
 CONTEXT_TAIL = 24  # messages sent to the model; state keeps everything
 
 # Tools whose successful call means "stop and wait for a human".
@@ -49,9 +51,16 @@ def _unwrap_result(result: Any) -> str:
         return str(result)[:6000]
 
 
-async def _execute_tool(tool: Any, args: dict[str, Any]) -> str:
+async def _execute_tool(
+    tool: Any, args: dict[str, Any], *, timeout_s: float = TOOL_TIMEOUT_S
+) -> str:
+    # An MCP tool call with no deadline can stall a run silently forever
+    # (a wedged server, a dropped response). Bound it: on timeout the
+    # worker gets an error observation it can work with instead of hanging.
     try:
-        result = await tool.ainvoke(args)
+        result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout_s)
+    except TimeoutError:
+        return json.dumps({"error": f"tool {getattr(tool, 'name', '?')} timed out"})
     except Exception as exc:
         return json.dumps({"error": str(exc)[:500]})
     return _unwrap_result(result)

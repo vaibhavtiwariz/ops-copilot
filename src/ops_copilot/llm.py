@@ -7,9 +7,11 @@ instead of failing the turn.
 
 import asyncio
 import re
+from contextvars import ContextVar
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable
 from langchain_litellm import ChatLiteLLM
 
@@ -27,6 +29,27 @@ _LITELLM_PREFIX = {
 }
 
 _MAX_RATE_LIMIT_RETRIES = 3
+
+# The runner sets this to (bus, thread_id) while a graph run is in flight,
+# so rate-limit waits can surface as console events instead of silent
+# "working..." stalls. Unset (None) outside a run, e.g. in evals and tests.
+rate_limit_sink: ContextVar[tuple[Any, str] | None] = ContextVar("rate_limit_sink", default=None)
+
+
+def ensure_user_message(messages: list) -> list:
+    """Guarantee at least one user-role message in an outbound prompt.
+
+    Some chat templates (Groq/qwen) reject a prompt with no user message
+    ("No user query found in messages"). The synthesis prompt used to be
+    system-only; worker prompts can also lose their user turn when the
+    context tail slices past the last HumanMessage. Append-only and
+    only-if-absent: it never splits an AIMessage(tool_calls)/ToolMessage
+    pair, so tool transcripts are untouched.
+    """
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            return messages
+    return [*messages, HumanMessage(content="Continue.")]
 
 
 def _attr_for(env_name: str) -> str:
@@ -57,6 +80,7 @@ async def ainvoke_patient(
     several. The API reports exactly how long to wait - we honor it up to
     three times before giving up and surfacing the error.
     """
+    messages = ensure_user_message(messages)
     for attempt in range(_MAX_RATE_LIMIT_RETRIES):
         try:
             return await model.ainvoke(messages)
@@ -70,6 +94,23 @@ async def ainvoke_patient(
                 attempt=attempt + 1,
                 waiting_seconds=round(wait),
             )
+            # Surface the wait on the console: a silent "working..." reads
+            # as a stall. Best-effort; a failed publish must not break the
+            # retry.
+            sink = rate_limit_sink.get()
+            if sink is not None:
+                try:
+                    bus, thread_id = sink
+                    await bus.publish(
+                        thread_id,
+                        {
+                            "type": "rate_limited",
+                            "wait_seconds": round(wait),
+                            "context": context,
+                        },
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(wait)
     return await model.ainvoke(messages)
 

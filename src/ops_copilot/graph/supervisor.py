@@ -83,6 +83,15 @@ async def _synthesize(state: AgentState) -> str:
         f"task {t.id} ({t.assignee}, {t.status}): {t.description}\n  outcome: {t.summary}"
         for t in tasks
     ]
+    # Chat templates on some providers (Groq/qwen) reject a prompt with no
+    # user-role message ("No user query found in messages"). This prompt used
+    # to be system-only, so carry the user's question as the user turn.
+    user_query = "Summarize the completed work for the user."
+    for message in reversed(state.get("messages") or []):
+        if isinstance(message, HumanMessage):
+            content = message.content
+            user_query = content if isinstance(content, str) else str(content)
+            break
     prompt = [
         SystemMessage(content=SUPERVISOR_SYSTEM),
         SystemMessage(
@@ -91,6 +100,7 @@ async def _synthesize(state: AgentState) -> str:
             + "\n\nWrite the user-facing wrap-up. Lead with the answer, include key numbers,"
             " mention anything still blocked on human approval. No preamble."
         ),
+        HumanMessage(content=user_query),
     ]
     response = await ainvoke_patient(model, prompt, context="synthesis")
     return getattr(response, "text", None) or str(response.content)
