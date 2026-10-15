@@ -7,7 +7,16 @@ class TestClaimDetection:
     def test_detects_execution_claims(self):
         assert claims_execution("The order has been refunded successfully")
         assert claims_execution("I initiated the refund for order 42")
-        assert claims_execution("Comment posted on the PR")
+
+    def test_bare_participles_are_not_claims(self):
+        # A bare participle ("orders processed") is indistinguishable from
+        # a descriptive noun phrase in a read-only summary, so it is not
+        # flagged. Only first-person and passive-with-auxiliary assertions
+        # count. This is what kept a read-only revenue answer from being
+        # branded an unverified action claim.
+        assert not claims_execution("Comment posted on the PR")
+        assert not claims_execution("335 orders processed")
+        assert not claims_execution("Revenue from paid orders")
 
     def test_neutral_answers_pass(self):
         assert not claims_execution("Total revenue was 2,031,465.8 dollars")

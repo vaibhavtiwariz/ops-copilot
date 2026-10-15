@@ -147,6 +147,21 @@ class TestThreadTokens:
         )
         assert denied.status_code == 403
 
+    def test_approval_with_nothing_waiting_returns_409(self, client):
+        # Backend half of the decide() 409 branch: when the gate is gone
+        # (interrupt already consumed), the console clears the card
+        # instead of restoring a card that can never decide. The
+        # frontend branch itself has no JS test harness in this repo;
+        # this pins the contract it branches on.
+        thread_id, token = make_thread(client)
+        response = client.post(
+            f"/api/threads/{thread_id}/approvals",
+            json={"approved": True},
+            headers=thread_headers(token),
+        )
+        assert response.status_code == 409
+        assert "nothing is waiting" in response.json()["detail"]
+
     def test_history_requires_thread_token(self, client):
         thread_id, _token = make_thread(client)
         denied = client.get(f"/api/threads/{thread_id}/history", headers=AUTH_HEADERS)
