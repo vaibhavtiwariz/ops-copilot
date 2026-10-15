@@ -151,7 +151,8 @@ def seed_demo(dsn: str, customers: int = 40, orders: int = 400, incidents: int =
         with conn.cursor() as cur:
             for _ in range(orders):
                 cur.execute(
-                    "insert into orders (customer_id, amount_cents, status, created_at) values (%s, %s, %s, %s)",
+                    "insert into orders (customer_id, amount_cents, status, created_at) "
+                    "values (%s, %s, %s, %s)",
                     (
                         rng.choice(ids),
                         rng.randint(900, 120_000),

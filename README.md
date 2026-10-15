@@ -102,6 +102,9 @@ open http://localhost:3000
 Or skip Docker entirely: `OPS_MCP_TRANSPORT=stdio` spawns both MCP servers as
 subprocesses of the API.
 
+A browser page refresh (F5) requires starting a new thread session by design,
+to preserve per-thread isolation.
+
 ### Five-minute demo script
 
 | ask the copilot | what it shows |
@@ -116,6 +119,16 @@ subprocesses of the API.
 `POST /api/threads/{id}/replay {"checkpoint_id": ...}` forks execution from any
 of them.
 
+### Local Debugging & Inspection
+
+The MCP ports are intentionally unpublished, so inspect the database through
+compose exec instead of a host port:
+
+```bash
+docker compose exec postgres psql -U ops -d ops_ops
+docker compose exec postgres psql -U ops -d ops_checkpoints
+```
+
 ## Stack
 
 Python 3.11 · LangGraph 1.x (`interrupt` / `Command` resume) · FastMCP ·
@@ -123,6 +136,9 @@ langchain-mcp-adapters · LiteLLM (Groq/Gemini/Ollama/openai-compatible) · psyc
 WebSockets · Next.js 14 + Tailwind · Docker Compose ·
 structlog. Observability hooks are env-gated (Phoenix endpoint, LangSmith) so
 nothing requires an account to run.
+
+Dependency locking: run `uv lock` on the dev machine and switch the Dockerfile
+back to `uv sync --frozen` when locking dependencies.
 
 ## Repository layout
 
@@ -167,6 +183,10 @@ Stated plainly rather than hidden ([more](docs/adrs/0006-eval-strategy.md)):
   subprotocol). There is no user or principal concept: anyone holding the key
   can create threads, and anyone holding a thread's token can drive it. Full
   multi-user auth is out of scope for this pass.
+- The single-use approval-token ledger lives in process memory, so an API
+  restart inside the 15-minute token window resets it. Primary defenses
+  remain token non-exposure, TTL plus target/content binding plus signature,
+  and the replay guard that refuses re-execution past the approval gate.
 
 ## License
 

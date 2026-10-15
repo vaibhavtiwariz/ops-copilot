@@ -148,7 +148,10 @@ async def executor(state: AgentState) -> Command[Literal["supervisor"]]:
                     }
                 )
             )
-            summary = f"posted approved comment on {payload['repo']}#{payload['number']} (posted={outcome.get('posted')})"
+            summary = (
+                f"posted approved comment on {payload['repo']}#{payload['number']} "
+                f"(posted={outcome.get('posted')})"
+            )
         else:
             raise RuntimeError(f"unknown gated action kind {kind!r}")
     except Exception as exc:

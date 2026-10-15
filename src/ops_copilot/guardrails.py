@@ -251,5 +251,6 @@ def check_budget(messages: list, limit: int) -> None:
     used = tokens_of(messages)
     if used > limit:
         raise BudgetExceeded(
-            f"run consumed ~{used} tokens against a budget of {limit}; halting before more tool calls"
+            f"run consumed ~{used} tokens against a budget of {limit}; "
+            "halting before more tool calls"
         )

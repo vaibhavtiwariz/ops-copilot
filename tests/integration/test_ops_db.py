@@ -180,7 +180,8 @@ def approve_in_db(proposal_id: int) -> None:
     """What the API's approval endpoint does before resuming the graph."""
     with psycopg.connect(_dsn(), autocommit=True) as conn:
         conn.execute(
-            "insert into approvals (proposal_id, approved, note, decided_by) values (%s, true, 'test', 'pytest')",
+            "insert into approvals (proposal_id, approved, note, decided_by) "
+            "values (%s, true, 'test', 'pytest')",
             (proposal_id,),
         )
         conn.execute("update proposals set status = 'approved' where id = %s", (proposal_id,))

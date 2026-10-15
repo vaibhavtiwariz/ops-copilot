@@ -2,6 +2,31 @@
 
 Running log of every change the fix team makes and why. Newest first. Each entry names the finding, the files touched, what changed, and why in plain language.
 
+## 2026-10-15: DOC: README notes the uv lock flow for reproducible builds
+- Files: README.md
+- What: added a line telling the host operator to run `uv lock` on the dev machine and switch the Dockerfile back to `uv sync --frozen` when locking dependencies.
+- Why: no lockfile is generated in this sandbox, and the dev machine is the source of truth for dependency resolution. The Dockerfile already documents the path back to --frozen once a lockfile exists.
+
+## 2026-10-15: DOC: README notes F5 starts a new thread session by design
+- Files: README.md
+- What: added a line stating that a browser page refresh (F5) requires starting a new thread session by design, to preserve per-thread isolation.
+- Why: thread tokens stay in memory only, never persisted, so a refresh loses them. Moving them to sessionStorage was considered and rejected: module-scoped storage is not reachable from window scope, while sessionStorage is globally reachable by any script in the origin, and tokens have no expiry, so persistence would extend exposure. A token re-issue endpoint was also considered and rejected: with a shared API key it would let any key holder re-mint another thread's token and break S4 isolation.
+
+## 2026-10-15: DOC: README documents the M1 ledger restart window as accepted risk
+- Files: README.md
+- What: added a Known limitations bullet: the single-use approval-token ledger lives in process memory, so an API restart inside the 15-minute token window resets it. Primary defenses remain token non-exposure, TTL plus target/content binding plus signature, and the replay guard.
+- Why: keeping the source-control MCP service database-free preserves the service boundary and least privilege. The TTL was left at 900 seconds: tightening to 300 would pressure human reviewers and risk legitimate approvals expiring mid-review.
+
+## 2026-10-15: DOC: README adds a local debugging snippet
+- Files: README.md
+- What: added a "Local Debugging & Inspection" snippet with docker compose exec postgres psql commands for the ops_ops and ops_checkpoints databases, plus a line that MCP ports are intentionally unpublished.
+- Why: no override file or token-printing helper was created. Publishing MCP ports on loopback would reintroduce the S1 gate bypass for any local process, and printing tokens would put live credentials in shell history. Compose exec inspects the database without either risk.
+
+## 2026-10-15: FIX: E501 global ignore removed, remaining long lines fixed
+- Files: pyproject.toml, src/ops_copilot/graph/gate.py, src/ops_copilot/guardrails.py, scripts/bootstrap_db.py, tests/integration/test_ops_db.py, src/ops_copilot/graph/prompts.py
+- What: removed E501 from the ruff ignore list. Wrapped the 2 plain f-strings and the 2 SQL strings via concatenation, verified byte-identical to the originals. The 2 prompts.py lines got a targeted per-file ignore instead of inline noqa.
+- Why: a global ignore blinded the linter repo-wide for the sake of 6 lines, and the parallel-pass file locking that justified it is over. The prompts.py lines sit inside triple-quoted prompt strings, so appending `# noqa: E501` to them would change the prompt bytes and invalidate the eval baseline; the per-file ignore suppresses E501 for prompts.py (which today has only those 2 long lines) without touching the bytes.
+
 ## 2026-10-15: FIX: lint fix on the proxy port check
 - Files: src/ops_copilot/mcp/client.py
 - What: assigned the port check result instead of leaving it as a bare expression.
